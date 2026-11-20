@@ -7,6 +7,7 @@ import { MongoClient, ObjectId } from 'mongodb';
 const app = express();
 const port = process.env.PORT || 7000;
 const MAX_RESUME_SIZE_BYTES = 10 * 1024 * 1024;
+const FREE_APPLICATION_LIMIT = 13;
 
 const allowedOrigins = new Set(
   (
@@ -80,6 +81,7 @@ const jobs = database.collection("jobs");
 const companies = database.collection("companies");
 const applications = database.collection("applications");
 const applicationUsage = database.collection("applicationUsage");
+const payments = database.collection("payments");
 const savedJobs = database.collection("savedJobs");
 const resumes = database.collection("resumes");
 
@@ -87,6 +89,7 @@ await applications.createIndex({ userId: 1, jobId: 1 }, { unique: true });
 await applications.createIndex({ userId: 1, appliedAt: -1 });
 await applications.createIndex({ jobId: 1, appliedAt: -1 });
 await applicationUsage.createIndex({ userId: 1, period: 1 }, { unique: true });
+await payments.createIndex({ userId: 1, createdAt: -1 });
 await savedJobs.createIndex({ userId: 1, jobId: 1 }, { unique: true });
 await savedJobs.createIndex({ userId: 1, savedAt: -1 });
 await resumes.createIndex({ userId: 1 }, { unique: true });
@@ -163,8 +166,23 @@ function requireAdmin(req, res, next) {
   return next();
 }
 
+function getApplicationPlan(accountPlan, sessionPlan) {
+  const plan = String(accountPlan ?? sessionPlan ?? "free").toLowerCase();
+  return plan === "growth" || plan === "premium" ? plan : "free";
+}
+
+function getApplicationPeriod(date = new Date()) {
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+function getApplicationLimit(plan) {
+  if (plan === "free") return FREE_APPLICATION_LIMIT;
+  if (plan === "growth") return 31;
+  return null;
+}
+
 async function reserveApplicationUsage(userId, period, plan) {
-  const limit = plan === "free" ? 27 : null;
+  const limit = getApplicationLimit(plan);
   const filter = { userId, period };
   if (limit !== null) filter.count = { $lt: limit };
 
@@ -239,6 +257,21 @@ function serializeApplication(application) {
     id: _id.toString(),
     jobId: jobId.toString(),
     appliedAt,
+  };
+}
+
+function serializePayment(payment) {
+  const date =
+    payment.createdAt instanceof Date
+      ? payment.createdAt.toISOString()
+      : payment.createdAt;
+
+  return {
+    id: payment._id.toString(),
+    date,
+    plan: payment.plan,
+    amountCents: payment.amountCents,
+    transactionId: payment.transactionId,
   };
 }
 
@@ -627,6 +660,78 @@ app.get("/jobs/:id", async (req, res) => {
 });
 
 // Seeker applications
+app.get("/billing/payments", requireAuthenticatedUser, async (req, res) => {
+  if (req.authUser.role && req.authUser.role !== "seeker") {
+    return res.status(403).json({
+      code: "SEEKER_ACCOUNT_REQUIRED",
+      error: "Only seeker accounts can view payment history.",
+    });
+  }
+
+  try {
+    const records = await payments
+      .find({ userId: req.authUser.id })
+      .sort({ createdAt: -1 })
+      .toArray();
+    return res.json(records.map(serializePayment));
+  } catch (err) {
+    console.error("Failed to load seeker payment history:", err);
+    return res.status(500).json({
+      error: "Could not load your payment history. Please try again.",
+    });
+  }
+});
+
+app.get("/applications/usage", requireAuthenticatedUser, async (req, res) => {
+  if (req.authUser.role && req.authUser.role !== "seeker") {
+    return res.status(403).json({
+      code: "SEEKER_ACCOUNT_REQUIRED",
+      error: "Only seeker accounts can view application usage.",
+    });
+  }
+
+  try {
+    const accountId = ObjectId.isValid(req.authUser.id)
+      ? new ObjectId(req.authUser.id)
+      : req.authUser.id;
+    const account = await users.findOne(
+      { _id: accountId },
+      { projection: { role: 1, plan: 1 } }
+    );
+    if (!account) {
+      return res.status(401).json({ error: "Your account could not be found." });
+    }
+    if (account.role && account.role !== "seeker") {
+      return res.status(403).json({
+        code: "SEEKER_ACCOUNT_REQUIRED",
+        error: "Only seeker accounts can view application usage.",
+      });
+    }
+
+    const plan = getApplicationPlan(account.plan, req.authUser.plan);
+    const period = getApplicationPeriod();
+    const usage = await applicationUsage.findOne({
+      userId: req.authUser.id,
+      period,
+    });
+    const limit = getApplicationLimit(plan);
+    const used = usage?.count ?? 0;
+
+    return res.json({
+      plan,
+      used,
+      limit,
+      remaining: limit === null ? null : Math.max(limit - used, 0),
+      period,
+    });
+  } catch (err) {
+    console.error("Failed to load seeker application usage:", err);
+    return res.status(500).json({
+      error: "Could not check your application usage. Please try again.",
+    });
+  }
+});
+
 app.post("/applications", requireAuthenticatedUser, async (req, res) => {
   const userId = req.authUser.id;
   const body = req.body ?? {};
@@ -691,21 +796,16 @@ app.post("/applications", requireAuthenticatedUser, async (req, res) => {
       });
     }
 
-    const accountPlan = String(account.plan ?? req.authUser.plan ?? "free")
-      .toLowerCase();
-    const plan = ["growth", "premium"].includes(accountPlan)
-      ? accountPlan
-      : "free";
+    const plan = getApplicationPlan(account.plan, req.authUser.plan);
     const now = new Date();
-    const period = `${now.getUTCFullYear()}-${String(
-      now.getUTCMonth() + 1
-    ).padStart(2, "0")}`;
+    const period = getApplicationPeriod(now);
     const usage = await reserveApplicationUsage(userId, period, plan);
 
     if (!usage.allowed) {
+      const planName = plan === "growth" ? "Pro" : "Free";
       return res.status(429).json({
         code: "APPLICATION_LIMIT_REACHED",
-        error: `The Free plan allows up to ${usage.limit} applications per month.`,
+        error: `The ${planName} plan allows up to ${usage.limit} applications per month.`,
         used: usage.used,
         limit: usage.limit,
         plan,
