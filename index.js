@@ -6,6 +6,7 @@ import { MongoClient, ObjectId } from 'mongodb';
 
 const app = express();
 const port = process.env.PORT || 7000;
+const MAX_RESUME_SIZE_BYTES = 10 * 1024 * 1024;
 
 const allowedOrigins = new Set(
   (
@@ -16,8 +17,34 @@ const allowedOrigins = new Set(
     .map((origin) => origin.trim())
     .filter(Boolean)
 );
+const betterAuthUrl =
+  process.env.BETTER_AUTH_URL ??
+  (process.env.NODE_ENV === "production"
+    ? undefined
+    : allowedOrigins.values().next().value);
 
 app.use(express.json());
+function parseResumePdf(req, res, next) {
+  express.raw({
+    type: "application/pdf",
+    limit: MAX_RESUME_SIZE_BYTES,
+  })(req, res, (err) => {
+    if (!err) return next();
+    if (err.type === "entity.too.large") {
+      return res.status(413).json({
+        code: "RESUME_TOO_LARGE",
+        error: "Resume files must be 10 MB or smaller.",
+      });
+    }
+    if (err.status === 400) {
+      return res.status(400).json({
+        code: "INVALID_RESUME_BODY",
+        error: "Could not read the uploaded resume.",
+      });
+    }
+    return next(err);
+  });
+}
 app.use(
   cors({
     origin(origin, callback) {
@@ -53,27 +80,36 @@ const jobs = database.collection("jobs");
 const companies = database.collection("companies");
 const applications = database.collection("applications");
 const applicationUsage = database.collection("applicationUsage");
+const savedJobs = database.collection("savedJobs");
+const resumes = database.collection("resumes");
 
 await applications.createIndex({ userId: 1, jobId: 1 }, { unique: true });
 await applications.createIndex({ userId: 1, appliedAt: -1 });
+await applications.createIndex({ jobId: 1, appliedAt: -1 });
 await applicationUsage.createIndex({ userId: 1, period: 1 }, { unique: true });
+await savedJobs.createIndex({ userId: 1, jobId: 1 }, { unique: true });
+await savedJobs.createIndex({ userId: 1, savedAt: -1 });
+await resumes.createIndex({ userId: 1 }, { unique: true });
+await jobs.createIndex({ recruiterId: 1, createdAt: -1 });
+await companies.createIndex({ recruiterId: 1 }, { unique: true, sparse: true });
 
 async function requireAuthenticatedUser(req, res, next) {
   if (!req.headers.cookie) {
     return res.status(401).json({ error: "Sign in to continue." });
   }
 
-  if (!process.env.BETTER_AUTH_URL) {
+  if (!betterAuthUrl) {
     return res
       .status(503)
-      .json({ error: "Authentication verification is not configured." });
+      .json({
+        code: "AUTH_CONFIGURATION_MISSING",
+        error:
+          "Authentication verification is not configured. Set BETTER_AUTH_URL to the origin serving Better Auth.",
+      });
   }
 
   try {
-    const sessionUrl = new URL(
-      "/api/auth/get-session",
-      process.env.BETTER_AUTH_URL
-    );
+    const sessionUrl = new URL("/api/auth/get-session", betterAuthUrl);
     const sessionResponse = await fetch(sessionUrl, {
       headers: {
         accept: "application/json",
@@ -105,6 +141,26 @@ async function requireAuthenticatedUser(req, res, next) {
       .status(503)
       .json({ error: "Could not verify your sign-in. Please try again." });
   }
+}
+
+function requireRecruiter(req, res, next) {
+  if (req.authUser?.role !== "recruiter") {
+    return res.status(403).json({
+      code: "RECRUITER_ACCOUNT_REQUIRED",
+      error: "Only recruiter accounts can manage job posts.",
+    });
+  }
+  return next();
+}
+
+function requireAdmin(req, res, next) {
+  if (req.authUser?.role !== "admin") {
+    return res.status(403).json({
+      code: "ADMIN_ACCOUNT_REQUIRED",
+      error: "Only admin accounts can review company registrations.",
+    });
+  }
+  return next();
 }
 
 async function reserveApplicationUsage(userId, period, plan) {
@@ -186,6 +242,86 @@ function serializeApplication(application) {
   };
 }
 
+function serializeSavedJob(savedJob) {
+  const { _id, jobId, ...fields } = savedJob;
+  const savedAt =
+    savedJob.savedAt instanceof Date
+      ? savedJob.savedAt.toISOString()
+      : savedJob.savedAt;
+
+  return {
+    ...fields,
+    id: _id.toString(),
+    jobId: jobId.toString(),
+    savedAt,
+  };
+}
+
+function serializeRecruiterJob(job, applicantCount = 0) {
+  const { _id, recruiterId, ...fields } = job;
+  const id = _id.toString();
+  return {
+    ...fields,
+    id,
+    _id: id,
+    applicants: applicantCount,
+  };
+}
+
+function serializeRecruiterApplication(application) {
+  const { _id, jobId, recruiterId, userId, ...fields } = application;
+  return {
+    ...fields,
+    id: _id.toString(),
+    jobId: jobId.toString(),
+    appliedAt:
+      application.appliedAt instanceof Date
+        ? application.appliedAt.toISOString()
+        : application.appliedAt,
+  };
+}
+
+function serializeCompany(company) {
+  const fields = { ...company };
+  const id = fields._id.toString();
+  delete fields._id;
+  delete fields.recruiterId;
+  return { ...fields, id, _id: id };
+}
+
+function getCompanyFields(body) {
+  const fields = { ...body };
+  delete fields._id;
+  delete fields.recruiterId;
+  delete fields.status;
+  delete fields.createdAt;
+  delete fields.updatedAt;
+  return fields;
+}
+
+async function listRecruiterJobs(recruiterId) {
+  const ownedJobs = await jobs
+    .find({ recruiterId })
+    .sort({ createdAt: -1 })
+    .toArray();
+  if (ownedJobs.length === 0) return [];
+
+  const jobIds = ownedJobs.map((job) => job._id);
+  const applicantCounts = await applications
+    .aggregate([
+      { $match: { jobId: { $in: jobIds } } },
+      { $group: { _id: "$jobId", count: { $sum: 1 } } },
+    ])
+    .toArray();
+  const countByJobId = new Map(
+    applicantCounts.map((entry) => [entry._id.toString(), entry.count])
+  );
+
+  return ownedJobs.map((job) =>
+    serializeRecruiterJob(job, countByJobId.get(job._id.toString()) ?? 0)
+  );
+}
+
 
 app.get('/', (req, res) => {
   res.send('The Hireloop backend is operating smoothly and efficiently!!');
@@ -198,12 +334,258 @@ app.get('/users', async(req, res) =>{
 })
 
 // Jobs related APIs
-app.post('/jobs', async (req, res) =>{
-  const job = req.body;
-  const result = await jobs.insertOne(job);
-  // Return the saved document (including _id) so the client can use it right away.
-  res.send({ ...job, _id: result.insertedId });
-})
+app.post("/jobs", requireAuthenticatedUser, requireRecruiter, async (req, res) => {
+  if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+    return res.status(400).json({
+      code: "INVALID_JOB",
+      error: "Job details are required.",
+    });
+  }
+
+  const job = { ...req.body };
+  delete job._id;
+  delete job.userId;
+  delete job.recruiterId;
+  delete job.createdBy;
+  delete job.applicants;
+  delete job.status;
+  job.recruiterId = req.authUser.id;
+  job.createdAt = new Date().toISOString();
+
+  try {
+    const result = await jobs.insertOne(job);
+    return res.status(201).json({ ...job, id: result.insertedId.toString() });
+  } catch (err) {
+    console.error("Failed to create recruiter job:", err);
+    return res.status(500).json({
+      error: "Could not publish the job. Please try again.",
+    });
+  }
+});
+
+app.get(
+  "/recruiter/jobs",
+  requireAuthenticatedUser,
+  requireRecruiter,
+  async (req, res) => {
+    try {
+      return res.json(await listRecruiterJobs(req.authUser.id));
+    } catch (err) {
+      console.error("Failed to load recruiter jobs:", err);
+      return res.status(500).json({
+        error: "Could not load your job posts. Please try again.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/recruiter/dashboard",
+  requireAuthenticatedUser,
+  requireRecruiter,
+  async (req, res) => {
+    try {
+      const ownedJobs = await listRecruiterJobs(req.authUser.id);
+      const jobIds = ownedJobs.map((job) => new ObjectId(job.id));
+      const recentApplications = jobIds.length
+        ? await applications
+            .find({ jobId: { $in: jobIds } })
+            .sort({ appliedAt: -1 })
+            .limit(5)
+            .toArray()
+        : [];
+      const now = new Date();
+      const isExpired = (job) => {
+        if (!job.deadline) return false;
+        const deadline = new Date(job.deadline);
+        return !Number.isNaN(deadline.getTime()) && deadline < now;
+      };
+      const activeJobs = ownedJobs.filter((job) =>
+        job.status ? job.status === "Active" : !isExpired(job)
+      ).length;
+      const jobsClosed = ownedJobs.filter(
+        (job) =>
+          job.status === "Closed" ||
+          job.status === "Expired" ||
+          (!job.status && isExpired(job))
+      ).length;
+
+      return res.json({
+        stats: {
+          totalJobPosts: ownedJobs.length,
+          totalApplicants: ownedJobs.reduce(
+            (total, job) => total + job.applicants,
+            0
+          ),
+          activeJobs,
+          jobsClosed,
+        },
+        recentApplications: recentApplications.map(
+          serializeRecruiterApplication
+        ),
+      });
+    } catch (err) {
+      console.error("Failed to load recruiter dashboard:", err);
+      return res.status(500).json({
+        error: "Could not load your recruiter dashboard. Please try again.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/recruiter/notifications",
+  requireAuthenticatedUser,
+  requireRecruiter,
+  async (req, res) => {
+    try {
+      const ownedJobs = await jobs
+        .find({ recruiterId: req.authUser.id })
+        .project({ _id: 1 })
+        .toArray();
+      const jobIds = ownedJobs.map((job) => job._id);
+      const recentApplications = jobIds.length
+        ? await applications
+            .find({ jobId: { $in: jobIds } })
+            .sort({ appliedAt: -1 })
+            .limit(10)
+            .toArray()
+        : [];
+      const company = await companies.findOne(
+        { recruiterId: req.authUser.id },
+        { projection: { status: 1, reviewedAt: 1 } }
+      );
+      const reviewedAt =
+        company?.reviewedAt instanceof Date
+          ? company.reviewedAt.toISOString()
+          : company?.reviewedAt;
+      const companyReview =
+        (company?.status === "Approved" || company?.status === "Rejected") &&
+        typeof reviewedAt === "string"
+          ? {
+              id: company._id.toString(),
+              status: company.status,
+              reviewedAt,
+            }
+          : null;
+
+      return res.json({
+        applications: recentApplications.map(serializeRecruiterApplication),
+        companyReview,
+      });
+    } catch (err) {
+      console.error("Failed to load recruiter notifications:", err);
+      return res.status(500).json({
+        error: "Could not load your notifications. Please try again.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/recruiter/jobs/:jobId/applications",
+  requireAuthenticatedUser,
+  requireRecruiter,
+  async (req, res) => {
+    if (!ObjectId.isValid(req.params.jobId)) {
+      return res.status(400).json({
+        code: "INVALID_JOB_ID",
+        error: "A valid job ID is required.",
+      });
+    }
+
+    try {
+      const jobId = new ObjectId(req.params.jobId);
+      const job = await jobs.findOne({
+        _id: jobId,
+        recruiterId: req.authUser.id,
+      });
+      if (!job) {
+        return res.status(404).json({
+          code: "JOB_NOT_FOUND",
+          error: "Job not found.",
+        });
+      }
+
+      const jobApplications = await applications
+        .find({ jobId })
+        .sort({ appliedAt: -1 })
+        .toArray();
+      return res.json({
+        job: {
+          id: jobId.toString(),
+          title: job.title ?? "Untitled job",
+          company: job.company ?? "Company",
+        },
+        applications: jobApplications.map(serializeRecruiterApplication),
+      });
+    } catch (err) {
+      console.error("Failed to load recruiter job applications:", err);
+      return res.status(500).json({
+        error: "Could not load applicants for this job. Please try again.",
+      });
+    }
+  }
+);
+
+app.patch(
+  "/recruiter/jobs/:jobId/applications/:applicationId/status",
+  requireAuthenticatedUser,
+  requireRecruiter,
+  async (req, res) => {
+    const { jobId: jobIdParam, applicationId: applicationIdParam } = req.params;
+    const validStatuses = [
+      "Applied",
+      "Under Review",
+      "Shortlisted",
+      "Rejected",
+      "Offered",
+    ];
+    if (
+      !ObjectId.isValid(jobIdParam) ||
+      !ObjectId.isValid(applicationIdParam) ||
+      !validStatuses.includes(req.body?.status)
+    ) {
+      return res.status(400).json({
+        code: "INVALID_APPLICATION_STATUS",
+        error: "A valid job, application, and status are required.",
+      });
+    }
+
+    try {
+      const jobId = new ObjectId(jobIdParam);
+      const applicationId = new ObjectId(applicationIdParam);
+      const job = await jobs.findOne({
+        _id: jobId,
+        recruiterId: req.authUser.id,
+      });
+      if (!job) {
+        return res.status(404).json({
+          code: "JOB_NOT_FOUND",
+          error: "Job not found.",
+        });
+      }
+
+      const result = await applications.updateOne(
+        { _id: applicationId, jobId },
+        { $set: { status: req.body.status, updatedAt: new Date() } }
+      );
+      if (!result.matchedCount) {
+        return res.status(404).json({
+          code: "APPLICATION_NOT_FOUND",
+          error: "Application not found for this job.",
+        });
+      }
+
+      return res.json({ updated: true, status: req.body.status });
+    } catch (err) {
+      console.error("Failed to update recruiter application status:", err);
+      return res.status(500).json({
+        error: "Could not update the application status. Please try again.",
+      });
+    }
+  }
+);
 
 app.get("/jobs", async (req, res) => {
   try {
@@ -223,7 +605,7 @@ app.get("/jobs", async (req, res) => {
     if (type && type !== "All") filter.jobType = type;
     if (minSalary) filter.minSalary = { $gte: Number(minSalary) };
     if (requirements) filter.requirements = new RegExp(requirements, "i");
-    const cursor = jobs.find(filter);
+    const cursor = jobs.find(filter).project({ recruiterId: 0 });
     const result = await cursor.toArray();
     res.send(result);
   } catch (err) {
@@ -233,7 +615,10 @@ app.get("/jobs", async (req, res) => {
 
 app.get("/jobs/:id", async (req, res) => {
   try {
-    const job = await jobs.findOne({ _id: new ObjectId(req.params.id) });
+    const job = await jobs.findOne(
+      { _id: new ObjectId(req.params.id) },
+      { projection: { recruiterId: 0 } }
+    );
     if (!job) return res.status(404).send({ error: "Job not found" });
     res.send(job);
   } catch (err) {
@@ -270,8 +655,9 @@ app.post("/applications", requireAuthenticatedUser, async (req, res) => {
   }
 
   try {
+    const accountId = ObjectId.isValid(userId) ? new ObjectId(userId) : userId;
     const account = await users.findOne(
-      { _id: userId },
+      { _id: accountId },
       { projection: { role: 1, plan: 1 } }
     );
     if (!account) {
@@ -406,6 +792,353 @@ app.get("/applications/me", requireAuthenticatedUser, async (req, res) => {
   }
 });
 
+app.get("/saved-jobs/me", requireAuthenticatedUser, async (req, res) => {
+  if (req.authUser.role && req.authUser.role !== "seeker") {
+    return res.status(403).json({
+      code: "SEEKER_ACCOUNT_REQUIRED",
+      error: "Only seeker accounts can view saved jobs.",
+    });
+  }
+
+  try {
+    const result = await savedJobs
+      .find({ userId: req.authUser.id })
+      .sort({ savedAt: -1 })
+      .toArray();
+    return res.json(result.map(serializeSavedJob));
+  } catch (err) {
+    console.error("Failed to load saved jobs:", err);
+    return res.status(500).json({
+      error: "Could not load your saved jobs. Please try again.",
+    });
+  }
+});
+
+app.post("/saved-jobs", requireAuthenticatedUser, async (req, res) => {
+  const userId = req.authUser.id;
+  const { jobId } = req.body ?? {};
+
+  if (req.authUser.role && req.authUser.role !== "seeker") {
+    return res.status(403).json({
+      code: "SEEKER_ACCOUNT_REQUIRED",
+      error: "Only seeker accounts can save jobs.",
+    });
+  }
+  if (typeof jobId !== "string" || !ObjectId.isValid(jobId)) {
+    return res.status(400).json({
+      code: "INVALID_JOB_ID",
+      error: "A valid job ID is required.",
+    });
+  }
+
+  try {
+    const jobObjectId = new ObjectId(jobId);
+    const job = await jobs.findOne({ _id: jobObjectId });
+    if (!job) {
+      return res.status(404).json({
+        code: "JOB_NOT_FOUND",
+        error: "This job is no longer available.",
+      });
+    }
+
+    const existing = await savedJobs.findOne({ userId, jobId: jobObjectId });
+    if (existing) {
+      return res.status(200).json({
+        savedJob: serializeSavedJob(existing),
+        alreadySaved: true,
+      });
+    }
+
+    const savedJob = {
+      userId,
+      jobId: jobObjectId,
+      jobTitle: job.title ?? "Untitled job",
+      company: job.company ?? "Company",
+      location: job.location ?? "",
+      minSalary: job.minSalary ?? null,
+      maxSalary: job.maxSalary ?? null,
+      frequency: job.frequency ?? "",
+      savedAt: new Date(),
+    };
+
+    try {
+      const result = await savedJobs.insertOne(savedJob);
+      return res.status(201).json({
+        savedJob: serializeSavedJob({
+          ...savedJob,
+          _id: result.insertedId,
+        }),
+        alreadySaved: false,
+      });
+    } catch (err) {
+      if (err?.code !== 11000) throw err;
+
+      const duplicate = await savedJobs.findOne({ userId, jobId: jobObjectId });
+      if (!duplicate) throw err;
+
+      return res.status(200).json({
+        savedJob: serializeSavedJob(duplicate),
+        alreadySaved: true,
+      });
+    }
+  } catch (err) {
+    console.error("Failed to save job:", err);
+    return res.status(500).json({
+      code: "SAVED_JOB_SAVE_FAILED",
+      error: "Could not save this job. Please try again.",
+    });
+  }
+});
+
+app.delete(
+  "/saved-jobs/:jobId",
+  requireAuthenticatedUser,
+  async (req, res) => {
+    if (req.authUser.role && req.authUser.role !== "seeker") {
+      return res.status(403).json({
+        code: "SEEKER_ACCOUNT_REQUIRED",
+        error: "Only seeker accounts can remove saved jobs.",
+      });
+    }
+    if (!ObjectId.isValid(req.params.jobId)) {
+      return res.status(400).json({
+        code: "INVALID_JOB_ID",
+        error: "A valid job ID is required.",
+      });
+    }
+
+    try {
+      const result = await savedJobs.deleteOne({
+        userId: req.authUser.id,
+        jobId: new ObjectId(req.params.jobId),
+      });
+      return res.json({ removed: result.deletedCount > 0 });
+    } catch (err) {
+      console.error("Failed to remove saved job:", err);
+      return res.status(500).json({
+        error: "Could not remove this saved job. Please try again.",
+      });
+    }
+  }
+);
+
+app.post("/profile/email", requireAuthenticatedUser, async (req, res) => {
+  if (req.authUser.role && req.authUser.role !== "seeker") {
+    return res.status(403).json({
+      code: "SEEKER_ACCOUNT_REQUIRED",
+      error: "Only seeker accounts can update this profile.",
+    });
+  }
+
+  if (typeof req.body?.email !== "string") {
+    return res.status(400).json({
+      code: "INVALID_EMAIL",
+      error: "Enter a valid email address.",
+    });
+  }
+
+  const email = req.body.email.trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({
+      code: "INVALID_EMAIL",
+      error: "Enter a valid email address.",
+    });
+  }
+
+  const userId = String(req.authUser.id);
+  if (email === String(req.authUser.email ?? "").toLowerCase()) {
+    return res.json({
+      email,
+      emailVerified: req.authUser.emailVerified === true,
+      unchanged: true,
+    });
+  }
+
+  try {
+    const accountId = ObjectId.isValid(userId) ? new ObjectId(userId) : userId;
+    const existing = await users.findOne(
+      { email },
+      { projection: { _id: 1 } }
+    );
+    if (existing && existing._id.toString() !== userId) {
+      return res.status(409).json({
+        code: "EMAIL_ALREADY_IN_USE",
+        error: "That email address is already associated with an account.",
+      });
+    }
+
+    const result = await users.updateOne(
+      { _id: accountId },
+      { $set: { email, emailVerified: false, updatedAt: new Date() } }
+    );
+    if (!result.matchedCount) {
+      return res.status(404).json({
+        error: "Your account could not be found.",
+      });
+    }
+
+    return res.json({ email, emailVerified: false, unchanged: false });
+  } catch (err) {
+    if (err?.code === 11000) {
+      return res.status(409).json({
+        code: "EMAIL_ALREADY_IN_USE",
+        error: "That email address is already associated with an account.",
+      });
+    }
+    console.error("Failed to update seeker email:", err);
+    return res.status(500).json({
+      error: "Could not update your email. Please try again.",
+    });
+  }
+});
+
+app.get("/profile/resume/info", requireAuthenticatedUser, async (req, res) => {
+  if (req.authUser.role && req.authUser.role !== "seeker") {
+    return res.status(403).json({
+      code: "SEEKER_ACCOUNT_REQUIRED",
+      error: "Only seeker accounts can view this profile.",
+    });
+  }
+
+  try {
+    const resume = await resumes.findOne(
+      { userId: req.authUser.id },
+      { projection: { fileName: 1, size: 1, updatedAt: 1 } }
+    );
+    return res.json({
+      resume: resume
+        ? {
+            fileName: resume.fileName,
+            size: resume.size,
+            updatedAt:
+              resume.updatedAt instanceof Date
+                ? resume.updatedAt.toISOString()
+                : resume.updatedAt,
+          }
+        : null,
+    });
+  } catch (err) {
+    console.error("Failed to load seeker resume metadata:", err);
+    return res.status(500).json({
+      error: "Could not load your resume details. Please try again.",
+    });
+  }
+});
+
+app.get("/profile/resume", requireAuthenticatedUser, async (req, res) => {
+  if (req.authUser.role && req.authUser.role !== "seeker") {
+    return res.status(403).json({
+      code: "SEEKER_ACCOUNT_REQUIRED",
+      error: "Only seeker accounts can download this resume.",
+    });
+  }
+
+  try {
+    const resume = await resumes.findOne({ userId: req.authUser.id });
+    if (!resume) {
+      return res.status(404).json({
+        code: "RESUME_NOT_FOUND",
+        error: "No resume has been uploaded yet.",
+      });
+    }
+
+    const pdf = Buffer.isBuffer(resume.data)
+      ? resume.data
+      : resume.data?.value?.(true);
+    if (!Buffer.isBuffer(pdf)) {
+      throw new Error("Stored resume data is not a buffer.");
+    }
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Length", pdf.length);
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename*=UTF-8''${encodeURIComponent(resume.fileName)}`
+    );
+    return res.send(pdf);
+  } catch (err) {
+    console.error("Failed to download seeker resume:", err);
+    return res.status(500).json({
+      error: "Could not download your resume. Please try again.",
+    });
+  }
+});
+
+app.put(
+  "/profile/resume",
+  requireAuthenticatedUser,
+  parseResumePdf,
+  async (req, res) => {
+    if (req.authUser.role && req.authUser.role !== "seeker") {
+      return res.status(403).json({
+        code: "SEEKER_ACCOUNT_REQUIRED",
+        error: "Only seeker accounts can upload a resume.",
+      });
+    }
+    if (!req.is("application/pdf") || !Buffer.isBuffer(req.body)) {
+      return res.status(415).json({
+        code: "PDF_REQUIRED",
+        error: "Upload a PDF resume.",
+      });
+    }
+    if (
+      req.body.length < 5 ||
+      req.body.subarray(0, 5).toString("ascii") !== "%PDF-"
+    ) {
+      return res.status(400).json({
+        code: "INVALID_PDF",
+        error: "The uploaded file is not a valid PDF.",
+      });
+    }
+
+    let fileName = req.get("x-file-name") || "resume.pdf";
+    try {
+      fileName = decodeURIComponent(fileName);
+    } catch {
+      return res.status(400).json({
+        code: "INVALID_FILE_NAME",
+        error: "The resume file name is invalid.",
+      });
+    }
+    fileName = fileName.replace(/[\\/"\r\n]/g, "_").slice(0, 180);
+    if (!fileName.toLowerCase().endsWith(".pdf")) {
+      return res.status(400).json({
+        code: "PDF_REQUIRED",
+        error: "Upload a PDF resume.",
+      });
+    }
+
+    try {
+      const now = new Date();
+      await resumes.updateOne(
+        { userId: req.authUser.id },
+        {
+          $set: {
+            fileName,
+            contentType: "application/pdf",
+            size: req.body.length,
+            data: req.body,
+            updatedAt: now,
+          },
+          $setOnInsert: { userId: req.authUser.id, createdAt: now },
+        },
+        { upsert: true }
+      );
+      return res.status(200).json({
+        fileName,
+        size: req.body.length,
+        updatedAt: now.toISOString(),
+      });
+    } catch (err) {
+      console.error("Failed to save seeker resume:", err);
+      return res.status(500).json({
+        error: "Could not save your resume. Please try again.",
+      });
+    }
+  }
+);
+
 //  app.delete('/jobs/:id', async(req, res) =>{
 //   const id = req.params.id;
 //   const query = {_id: new ObjectId(id)};
@@ -413,21 +1146,60 @@ app.get("/applications/me", requireAuthenticatedUser, async (req, res) => {
 //   res.send(result);
 //    })
 
-app.delete('/jobs/:id', async (req, res) => {
-  try {
-    const result = await jobs.deleteOne({ _id: new ObjectId(req.params.id) });
-    res.send(result);
+app.delete(
+  "/jobs/:id",
+  requireAuthenticatedUser,
+  requireRecruiter,
+  async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({
+        code: "INVALID_JOB_ID",
+        error: "A valid job ID is required.",
+      });
+    }
+
+   try {
+      const result = await jobs.deleteOne({
+        _id: new ObjectId(req.params.id),
+        recruiterId: req.authUser.id,
+      });
+      if (!result.deletedCount) {
+        return res.status(404).json({
+          code: "JOB_NOT_FOUND",
+          error: "Job not found.",
+        });
+      }
+      return res.json({ deleted: true });
   } catch (err) {
-    res.status(400).send({ error: 'Invalid job id' });
+      console.error("Failed to delete recruiter job:", err);
+      return res.status(500).json({
+        error: "Could not delete the job. Please try again.",
+      });
+   }
   }
-});
+);
 
 // Companies related APIs
+app.get(
+  "/recruiter/company",
+  requireAuthenticatedUser,
+  requireRecruiter,
+  async (req, res) => {
+    try {
+      const company = await companies.findOne({ recruiterId: req.authUser.id });
+      return res.json({ company: company ? serializeCompany(company) : null });
+    } catch (err) {
+      console.error("Failed to load recruiter company:", err);
+      return res.status(500).json({ error: "Failed to load company details." });
+    }
+  }
+);
+
 app.get('/companies', async (req, res) => {
   try {
     const cursor = companies.find({});
     const result = await cursor.toArray();
-    res.send(result);
+    res.send(result.map(serializeCompany));
   } catch (err) {
     res.status(500).send({ error: 'Failed to load companies' });
   }
@@ -437,50 +1209,114 @@ app.get('/companies/:id', async (req, res) => {
   try {
     const company = await companies.findOne({ _id: new ObjectId(req.params.id) });
     if (!company) return res.status(404).send({ error: 'Company not found' });
-    res.send(company);
+    res.send(serializeCompany(company));
   } catch (err) {
     res.status(400).send({ error: 'Invalid company id' });
   }
 });
 
-app.post('/companies', async (req, res) => {
-  try {
-    const company = { ...req.body, status: 'Pending', createdAt: new Date().toISOString() };
-    const result = await companies.insertOne(company);
-    res.send({ ...company, _id: result.insertedId });
-  } catch (err) {
-    res.status(500).send({ error: 'Failed to create company' });
+app.post(
+  "/companies",
+  requireAuthenticatedUser,
+  requireRecruiter,
+  async (req, res) => {
+    try {
+      if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+        return res.status(400).json({ error: "Company details are required." });
+      }
+      const fields = getCompanyFields(req.body);
+      const company = {
+        ...fields,
+        recruiterId: req.authUser.id,
+        status: "Pending",
+        createdAt: new Date().toISOString(),
+      };
+      const result = await companies.insertOne(company);
+      const savedCompany = { ...company, _id: result.insertedId };
+      return res.status(201).json(serializeCompany(savedCompany));
+    } catch (err) {
+      if (err?.code === 11000) {
+        return res.status(409).json({
+          code: "COMPANY_ALREADY_REGISTERED",
+          error: "You have already registered a company.",
+        });
+      }
+      console.error("Failed to create company:", err);
+      return res.status(500).send({ error: 'Failed to create company' });
+    }
   }
-});
+);
 
-app.put('/companies/:id', async (req, res) => {
-  try {
-    const { _id, ...updates } = req.body;
-    const result = await companies.updateOne(
-      { _id: new ObjectId(req.params.id) },
-      { $set: { ...updates, status: 'Pending' } }
-    );
-    const company = await companies.findOne({ _id: new ObjectId(req.params.id) });
-    res.send(company);
-  } catch (err) {
-    res.status(400).send({ error: 'Invalid company id' });
+app.put(
+  "/companies/:id",
+  requireAuthenticatedUser,
+  requireRecruiter,
+  async (req, res) => {
+    let companyId;
+    try {
+      if (!ObjectId.isValid(req.params.id)) {
+        return res.status(400).json({ error: "Invalid company id." });
+      }
+      companyId = new ObjectId(req.params.id);
+      if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+        return res.status(400).json({ error: "Company details are required." });
+      }
+      const updates = getCompanyFields(req.body);
+      const result = await companies.updateOne(
+        { _id: companyId, recruiterId: req.authUser.id },
+        { $set: { ...updates, status: "Pending", updatedAt: new Date().toISOString() } }
+      );
+      if (!result.matchedCount) {
+        return res.status(404).json({
+          code: "COMPANY_NOT_FOUND",
+          error: "Company not found.",
+        });
+      }
+      const company = await companies.findOne({
+        _id: companyId,
+        recruiterId: req.authUser.id,
+      });
+      return res.json(serializeCompany(company));
+    } catch (err) {
+      console.error("Failed to update recruiter company:", err);
+      return res.status(500).json({ error: "Failed to update company." });
+    }
   }
-});
+);
 
 // Admin: update company status
-app.patch('/companies/:id/status', async (req, res) => {
-  try {
-    const { status } = req.body;
-    await companies.updateOne(
-      { _id: new ObjectId(req.params.id) },
-      { $set: { status } }
-    );
-    const company = await companies.findOne({ _id: new ObjectId(req.params.id) });
-    res.send(company);
-  } catch (err) {
-    res.status(400).send({ error: 'Invalid company id' });
+app.patch(
+  "/companies/:id/status",
+  requireAuthenticatedUser,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { status } = req.body ?? {};
+      if (!["Pending", "Approved", "Rejected"].includes(status)) {
+        return res.status(400).json({
+          code: "INVALID_COMPANY_STATUS",
+          error: "Status must be Pending, Approved, or Rejected.",
+        });
+      }
+      if (!ObjectId.isValid(req.params.id)) {
+        return res.status(400).json({ error: "Invalid company id." });
+      }
+      const _id = new ObjectId(req.params.id);
+      const result = await companies.updateOne(
+        { _id },
+        { $set: { status, reviewedAt: new Date().toISOString() } }
+      );
+      if (!result.matchedCount) {
+        return res.status(404).json({ error: "Company not found." });
+      }
+      const company = await companies.findOne({ _id });
+      return res.json(serializeCompany(company));
+    } catch (err) {
+      console.error("Failed to update company status:", err);
+      return res.status(500).json({ error: "Failed to update company status." });
+    }
   }
-});
+);
 
 app.listen(port, () => {
   console.log(`hireloop is running on port ${port}`);
