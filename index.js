@@ -2,8 +2,9 @@ import express from 'express';
 import cors from 'cors';
 import 'dotenv/config'
 import { MongoClient, ObjectId } from 'mongodb';
+import Stripe from 'stripe';
 
-
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 const app = express();
 const port = process.env.PORT || 7000;
 const MAX_RESUME_SIZE_BYTES = 10 * 1024 * 1024;
@@ -90,6 +91,11 @@ await applications.createIndex({ userId: 1, appliedAt: -1 });
 await applications.createIndex({ jobId: 1, appliedAt: -1 });
 await applicationUsage.createIndex({ userId: 1, period: 1 }, { unique: true });
 await payments.createIndex({ userId: 1, createdAt: -1 });
+await payments.createIndex({ sessionId: 1 }, { unique: true, sparse: true });
+await payments.createIndex(
+  { stripeSessionId: 1 },
+  { unique: true, sparse: true }
+);
 await savedJobs.createIndex({ userId: 1, jobId: 1 }, { unique: true });
 await savedJobs.createIndex({ userId: 1, savedAt: -1 });
 await resumes.createIndex({ userId: 1 }, { unique: true });
@@ -173,6 +179,60 @@ function getApplicationPlan(accountPlan, sessionPlan) {
 
 function getApplicationPeriod(date = new Date()) {
   return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+function getRecruiterPlan(planValue) {
+  const plan = String(planValue ?? "free").toLowerCase();
+  if (plan === "growth") return "growth";
+  if (plan === "enterprise" || plan === "premium") return "enterprise";
+  return "free";
+}
+
+function getRecruiterJobLimit(plan) {
+  if (plan === "growth") return 17;
+  if (plan === "enterprise") return 50;
+  return 5;
+}
+
+function isActiveJob(job, now = new Date()) {
+  if (job.status) return job.status === "Active";
+  if (!job.deadline) return true;
+  const deadline = new Date(job.deadline);
+  return Number.isNaN(deadline.getTime()) || deadline >= now;
+}
+
+async function getRecruiterJobCapacity(recruiterId) {
+  const userId = ObjectId.isValid(recruiterId)
+    ? new ObjectId(recruiterId)
+    : recruiterId;
+  const account = await users.findOne(
+    { _id: userId },
+    { projection: { role: 1, plan: 1 } }
+  );
+  if (!account) {
+    const error = new Error("Your recruiter account could not be found.");
+    error.code = "RECRUITER_ACCOUNT_NOT_FOUND";
+    throw error;
+  }
+  if (account.role && account.role !== "recruiter") {
+    const error = new Error("Only recruiter accounts can manage job posts.");
+    error.code = "RECRUITER_ACCOUNT_REQUIRED";
+    throw error;
+  }
+
+  const plan = getRecruiterPlan(account.plan);
+  const limit = getRecruiterJobLimit(plan);
+  const recruiterJobs = await jobs
+    .find({ recruiterId }, { projection: { status: 1, deadline: 1 } })
+    .toArray();
+  const activeJobs = recruiterJobs.filter((job) => isActiveJob(job)).length;
+
+  return {
+    plan,
+    limit,
+    activeJobs,
+    remaining: Math.max(limit - activeJobs, 0),
+  };
 }
 
 function getApplicationLimit(plan) {
@@ -260,18 +320,223 @@ function serializeApplication(application) {
   };
 }
 
+
+
+// Payment verification and fulfillment
+const CHECKOUT_PLANS = {
+  seekers: {
+    Pro: { plan: "growth", amountCents: 1900 },
+    Premium: { plan: "premium", amountCents: 3900 },
+  },
+  recruiters: {
+    Growth: { plan: "growth", amountCents: 4900 },
+    Enterprise: { plan: "premium", amountCents: 14900 },
+  },
+};
+
+app.post(
+  "/payments/checkout-verify",
+  requireAuthenticatedUser,
+  async (req, res) => {
+    const { sessionId } = req.body ?? {};
+    if (
+      typeof sessionId !== "string" ||
+      !/^cs_(test|live)_[A-Za-z0-9]+$/.test(sessionId)
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "A valid Stripe Checkout session is required.",
+      });
+    }
+
+    try {
+      const session = await stripe.checkout.sessions.retrieve(sessionId, {
+        expand: ["payment_intent"],
+      });
+      const metadata = session.metadata ?? {};
+      const role = metadata.role;
+      const audience = metadata.audience;
+      const planName = metadata.planName;
+      const userId = metadata.userId;
+
+      const selectedPlan =
+        role === "seekers"
+          ? planName === "Pro"
+            ? CHECKOUT_PLANS.seekers.Pro
+            : planName === "Premium"
+              ? CHECKOUT_PLANS.seekers.Premium
+              : null
+          : role === "recruiters"
+            ? planName === "Growth"
+              ? CHECKOUT_PLANS.recruiters.Growth
+              : planName === "Enterprise"
+                ? CHECKOUT_PLANS.recruiters.Enterprise
+                : null
+            : null;
+
+      if (
+        metadata.app !== "hireloop" ||
+        audience !== role ||
+        (role !== "seekers" && role !== "recruiters") ||
+        !selectedPlan ||
+        metadata.plan !== selectedPlan.plan ||
+        !userId
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "This checkout session is not a valid HireLoop purchase.",
+        });
+      }
+
+      const accountRole =
+        role === "seekers" ? "seeker" : "recruiter";
+      if (
+        req.authUser.id !== userId ||
+        (req.authUser.role ?? "seeker") !== accountRole
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: "This checkout session does not belong to your account.",
+        });
+      }
+
+      if (session.client_reference_id !== userId) {
+        return res.status(400).json({
+          success: false,
+          error: "The Stripe checkout session account reference is invalid.",
+        });
+      }
+
+      if (
+        session.mode !== "subscription" ||
+        session.status !== "complete" ||
+        session.payment_status !== "paid" ||
+        session.currency !== "usd" ||
+        session.amount_total !== selectedPlan.amountCents
+      ) {
+        return res.status(409).json({
+          success: false,
+          error: "Stripe has not confirmed payment for this plan yet.",
+        });
+      }
+
+      const accountId = ObjectId.isValid(userId)
+        ? new ObjectId(userId)
+        : userId;
+      const account = await users.findOne(
+        { _id: accountId },
+        { projection: { role: 1 } }
+      );
+      if (!account) {
+        return res.status(404).json({
+          success: false,
+          error: "The account for this payment could not be found.",
+        });
+      }
+
+      const paymentIntentId =
+        typeof session.payment_intent === "string"
+          ? session.payment_intent
+          : session.payment_intent?.id;
+      const transactionId = paymentIntentId ?? session.id;
+      const createdAt = new Date(session.created * 1000);
+
+      await payments.updateOne(
+        {
+          $or: [{ sessionId }, { stripeSessionId: sessionId }, { _id: sessionId }],
+        },
+        {
+          $setOnInsert: {
+            userId,
+            role: accountRole,
+            plan: selectedPlan.plan,
+            planName,
+            amountCents: selectedPlan.amountCents,
+            currency: "usd",
+            sessionId,
+            stripeSessionId: sessionId,
+            transactionId,
+            payment_intent: paymentIntentId ?? null,
+            payment_status: "paid",
+            status: "complete",
+            customer_email: session.customer_email,
+            createdAt,
+            payment_date: createdAt,
+          },
+        },
+        { upsert: true }
+      );
+
+      const activation = await users.updateOne(
+        {
+          _id: accountId,
+          $or: [
+            { billingPlanUpdatedAt: { $exists: false } },
+            { billingPlanUpdatedAt: { $lte: createdAt } },
+          ],
+        },
+        {
+          $set: {
+            role: accountRole,
+            plan: selectedPlan.plan,
+            billingPlanUpdatedAt: createdAt,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      return res.json({
+        success: true,
+        role: accountRole,
+        plan: selectedPlan.plan,
+        planName,
+        planActivated: activation.matchedCount > 0,
+        transactionId,
+      });
+    } catch (error) {
+      console.error("Failed to verify Stripe checkout:", error);
+      return res.status(500).json({
+        success: false,
+        error: "Could not verify this payment. Please try again.",
+      });
+    }
+  }
+);
+
+
 function serializePayment(payment) {
-  const date =
+  const rawDate =
     payment.createdAt instanceof Date
       ? payment.createdAt.toISOString()
-      : payment.createdAt;
+      : payment.createdAt ??
+        (payment.payment_date instanceof Date
+          ? payment.payment_date.toISOString()
+          : payment.payment_date);
+  const date =
+    typeof rawDate === "string" && !Number.isNaN(Date.parse(rawDate))
+      ? new Date(rawDate).toISOString()
+      : new Date(0).toISOString();
+  const id =
+    payment._id instanceof ObjectId
+      ? payment._id.toString()
+      : payment._id?.toString() ??
+        payment.sessionId ??
+        payment.stripeSessionId ??
+        "";
+  const transactionId =
+    payment.transactionId ??
+    (typeof payment.payment_intent === "string"
+      ? payment.payment_intent
+      : payment.payment_intent?.id) ??
+    payment.sessionId ??
+    "";
 
   return {
-    id: payment._id.toString(),
-    date,
+    id,
+    date: date instanceof Date ? date.toISOString() : date,
     plan: payment.plan,
-    amountCents: payment.amountCents,
-    transactionId: payment.transactionId,
+    amountCents: payment.amountCents ?? 0,
+    transactionId,
   };
 }
 
@@ -367,6 +632,48 @@ app.get('/users', async(req, res) =>{
 })
 
 // Jobs related APIs
+app.get(
+  "/recruiter/job-capacity",
+  requireAuthenticatedUser,
+  requireRecruiter,
+  async (req, res) => {
+    try {
+      return res.json(await getRecruiterJobCapacity(req.authUser.id));
+    } catch (err) {
+      if (err?.code === "RECRUITER_ACCOUNT_NOT_FOUND") {
+        return res.status(401).json({ error: err.message, code: err.code });
+      }
+      if (err?.code === "RECRUITER_ACCOUNT_REQUIRED") {
+        return res.status(403).json({ error: err.message, code: err.code });
+      }
+      console.error("Failed to load recruiter job capacity:", err);
+      return res.status(500).json({
+        error: "Could not check your active job post limit. Please try again.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/recruiter/billing/payments",
+  requireAuthenticatedUser,
+  requireRecruiter,
+  async (req, res) => {
+    try {
+      const records = await payments
+        .find({ userId: req.authUser.id })
+        .sort({ createdAt: -1 })
+        .toArray();
+      return res.json(records.map(serializePayment));
+    } catch (err) {
+      console.error("Failed to load recruiter payment history:", err);
+      return res.status(500).json({
+        error: "Could not load your payment history. Please try again.",
+      });
+    }
+  }
+);
+
 app.post("/jobs", requireAuthenticatedUser, requireRecruiter, async (req, res) => {
   if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
     return res.status(400).json({
@@ -386,9 +693,24 @@ app.post("/jobs", requireAuthenticatedUser, requireRecruiter, async (req, res) =
   job.createdAt = new Date().toISOString();
 
   try {
+    const capacity = await getRecruiterJobCapacity(req.authUser.id);
+    if (capacity.activeJobs >= capacity.limit) {
+      return res.status(409).json({
+        code: "ACTIVE_JOB_LIMIT_REACHED",
+        error: `Your ${capacity.plan} plan allows up to ${capacity.limit} active job posts. Close or remove an active job, or upgrade your plan.`,
+        ...capacity,
+      });
+    }
+
     const result = await jobs.insertOne(job);
     return res.status(201).json({ ...job, id: result.insertedId.toString() });
   } catch (err) {
+    if (err?.code === "RECRUITER_ACCOUNT_NOT_FOUND") {
+      return res.status(401).json({ error: err.message, code: err.code });
+    }
+    if (err?.code === "RECRUITER_ACCOUNT_REQUIRED") {
+      return res.status(403).json({ error: err.message, code: err.code });
+    }
     console.error("Failed to create recruiter job:", err);
     return res.status(500).json({
       error: "Could not publish the job. Please try again.",
@@ -407,6 +729,127 @@ app.get(
       console.error("Failed to load recruiter jobs:", err);
       return res.status(500).json({
         error: "Could not load your job posts. Please try again.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/recruiter/jobs/:jobId",
+  requireAuthenticatedUser,
+  requireRecruiter,
+  async (req, res) => {
+    if (!ObjectId.isValid(req.params.jobId)) {
+      return res.status(400).json({
+        code: "INVALID_JOB_ID",
+        error: "A valid job ID is required.",
+      });
+    }
+
+    try {
+      const job = await jobs.findOne({
+        _id: new ObjectId(req.params.jobId),
+        recruiterId: req.authUser.id,
+      });
+      if (!job) {
+        return res.status(404).json({
+          code: "JOB_NOT_FOUND",
+          error: "Job not found.",
+        });
+      }
+
+      const applicantCount = await applications.countDocuments({
+        jobId: job._id,
+      });
+      return res.json(serializeRecruiterJob(job, applicantCount));
+    } catch (error) {
+      console.error("Failed to load recruiter job:", error);
+      return res.status(500).json({
+        error: "Could not load this job post. Please try again.",
+      });
+    }
+  }
+);
+
+app.put(
+  "/recruiter/jobs/:jobId",
+  requireAuthenticatedUser,
+  requireRecruiter,
+  async (req, res) => {
+    if (!ObjectId.isValid(req.params.jobId)) {
+      return res.status(400).json({
+        code: "INVALID_JOB_ID",
+        error: "A valid job ID is required.",
+      });
+    }
+
+    const body = req.body;
+    const requiredTextFields = [
+      "title",
+      "company",
+      "category",
+      "jobType",
+      "location",
+      "responsibilities",
+      "requirements",
+    ];
+    if (
+      !body ||
+      typeof body !== "object" ||
+      Array.isArray(body) ||
+      requiredTextFields.some(
+        (field) => typeof body[field] !== "string" || !body[field].trim()
+      ) ||
+      typeof body.isRemote !== "boolean" ||
+      ["deadline", "minSalary", "maxSalary", "frequency"].some(
+        (field) => field in body && typeof body[field] !== "string"
+      )
+    ) {
+      return res.status(400).json({
+        code: "INVALID_JOB",
+        error: "Complete all required job details before saving.",
+      });
+    }
+
+    const updates = {
+      title: body.title.trim(),
+      company: body.company.trim(),
+      category: body.category.trim(),
+      jobType: body.jobType.trim(),
+      isRemote: body.isRemote,
+      location: body.location.trim(),
+      deadline: body.deadline ?? "",
+      minSalary: body.minSalary ?? "",
+      maxSalary: body.maxSalary ?? "",
+      frequency: body.frequency ?? "per year",
+      responsibilities: body.responsibilities.trim(),
+      requirements: body.requirements.trim(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    try {
+      const jobId = new ObjectId(req.params.jobId);
+      const result = await jobs.updateOne(
+        { _id: jobId, recruiterId: req.authUser.id },
+        { $set: updates }
+      );
+      if (!result.matchedCount) {
+        return res.status(404).json({
+          code: "JOB_NOT_FOUND",
+          error: "Job not found.",
+        });
+      }
+
+      const updatedJob = await jobs.findOne({
+        _id: jobId,
+        recruiterId: req.authUser.id,
+      });
+      const applicantCount = await applications.countDocuments({ jobId });
+      return res.json(serializeRecruiterJob(updatedJob, applicantCount));
+    } catch (error) {
+      console.error("Failed to update recruiter job:", error);
+      return res.status(500).json({
+        error: "Could not update the job post. Please try again.",
       });
     }
   }
