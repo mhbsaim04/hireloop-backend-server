@@ -9,6 +9,12 @@ const app = express();
 const port = process.env.PORT || 7000;
 const MAX_RESUME_SIZE_BYTES = 10 * 1024 * 1024;
 const FREE_APPLICATION_LIMIT = 13;
+const allowedAdminEmails = new Set(
+  (process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean)
+);
 
 const allowedOrigins = new Set(
   (
@@ -142,6 +148,20 @@ async function requireAuthenticatedUser(req, res, next) {
       return res.status(401).json({ error: "Sign in to continue." });
     }
 
+    const accountId = ObjectId.isValid(sessionData.user.id)
+      ? new ObjectId(sessionData.user.id)
+      : sessionData.user.id;
+    const account = await users.findOne(
+      { _id: accountId },
+      { projection: { accountStatus: 1 } }
+    );
+    if (account?.accountStatus === "suspended") {
+      return res.status(403).json({
+        code: "ACCOUNT_SUSPENDED",
+        error: "This account is suspended. Contact HireLoop support for help.",
+      });
+    }
+
     req.authUser = sessionData.user;
     return next();
   } catch (err) {
@@ -163,10 +183,30 @@ function requireRecruiter(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  if (req.authUser?.role !== "admin") {
+  const isAllowedAdmin = allowedAdminEmails.has(
+    String(req.authUser?.email ?? "").trim().toLowerCase()
+  );
+  if (
+    req.authUser?.role !== "admin" ||
+    req.authUser?.emailVerified !== true ||
+    !isAllowedAdmin
+  ) {
     return res.status(403).json({
       code: "ADMIN_ACCOUNT_REQUIRED",
-      error: "Only admin accounts can review company registrations.",
+      error: "Only allowlisted admin accounts can manage platform data.",
+    });
+  }
+  return next();
+}
+
+function requireRecruiterOrAdmin(req, res, next) {
+  if (req.authUser?.role === "admin") {
+    return requireAdmin(req, res, next);
+  }
+  if (req.authUser?.role !== "recruiter") {
+    return res.status(403).json({
+      code: "JOB_MANAGEMENT_ROLE_REQUIRED",
+      error: "Only recruiters and admins can delete job posts.",
     });
   }
   return next();
@@ -625,11 +665,485 @@ app.get('/', (req, res) => {
   res.send('The Hireloop backend is operating smoothly and efficiently!!');
 });
 
-app.get('/users', async(req, res) =>{
-  const cursor = users.find({});
-  const result = await cursor.toArray();
-  res.send(result);
-})
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function serializeAdminUser(user) {
+  return {
+    id: user._id.toString(),
+    name: user.name ?? "",
+    email: user.email ?? "",
+    role: user.role === "recruiter" ? "recruiter" : "seeker",
+    joinedAt:
+      user.createdAt instanceof Date
+        ? user.createdAt.toISOString()
+        : user.createdAt ?? null,
+    status: user.accountStatus === "suspended" ? "suspended" : "active",
+  };
+}
+
+app.get("/users", requireAuthenticatedUser, requireAdmin, async (req, res) => {
+  try {
+    const userRoleFilter = {
+      $or: [
+        { role: { $in: ["seeker", "recruiter"] } },
+        { role: { $exists: false } },
+      ],
+    };
+    const records = await users
+      .find(
+        userRoleFilter,
+        {
+          projection: {
+            name: 1,
+            email: 1,
+            role: 1,
+            createdAt: 1,
+            accountStatus: 1,
+          },
+        }
+      )
+      .sort({ createdAt: -1 })
+      .toArray();
+    return res.json(records.map(serializeAdminUser));
+  } catch (error) {
+    console.error("Failed to load users for admin:", error);
+    return res.status(500).json({
+      error: "Could not load platform users. Please try again.",
+    });
+  }
+});
+
+app.get(
+  "/admin/dashboard",
+  requireAuthenticatedUser,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const now = new Date();
+      const firstDay = new Date(
+        Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 29)
+      );
+      const [
+        totalUsers,
+        totalRecruiters,
+        totalCompanies,
+        totalJobs,
+        revenueRecords,
+        categoryRecords,
+        registrationRecords,
+        recentPaymentRecords,
+      ] = await Promise.all([
+        users.countDocuments({}),
+        users.countDocuments({ role: "recruiter" }),
+        companies.countDocuments({}),
+        jobs.countDocuments({}),
+        payments
+          .aggregate([
+            { $match: { payment_status: "paid" } },
+            { $group: { _id: null, total: { $sum: "$amountCents" } } },
+          ])
+          .toArray(),
+        jobs
+          .aggregate([
+            {
+              $group: {
+                _id: { $ifNull: ["$category", "Other"] },
+                count: { $sum: 1 },
+              },
+            },
+            { $sort: { count: -1, _id: 1 } },
+          ])
+          .toArray(),
+        users
+          .aggregate([
+            { $match: { createdAt: { $gte: firstDay } } },
+            {
+              $group: {
+                _id: {
+                  $dateToString: {
+                    format: "%Y-%m-%d",
+                    date: "$createdAt",
+                    timezone: "UTC",
+                  },
+                },
+                count: { $sum: 1 },
+              },
+            },
+          ])
+          .toArray(),
+        payments
+          .find({ payment_status: "paid" })
+          .sort({ createdAt: -1 })
+          .limit(8)
+          .toArray(),
+      ]);
+
+      const userIds = [
+        ...new Set(
+          recentPaymentRecords
+            .map((payment) => String(payment.userId ?? ""))
+            .filter(Boolean)
+        ),
+      ];
+      const mongoUserIds = userIds.flatMap((id) =>
+        ObjectId.isValid(id) ? [id, new ObjectId(id)] : [id]
+      );
+      const paymentUsers =
+        mongoUserIds.length > 0
+          ? await users
+              .find(
+                { _id: { $in: mongoUserIds } },
+                { projection: { name: 1, email: 1 } }
+              )
+              .toArray()
+          : [];
+      const usersById = new Map(
+        paymentUsers.map((user) => [user._id.toString(), user])
+      );
+      const registrationsByDate = new Map(
+        registrationRecords.map((record) => [record._id, record.count])
+      );
+      const userRegistrations = Array.from({ length: 30 }, (_, index) => {
+        const date = new Date(firstDay);
+        date.setUTCDate(firstDay.getUTCDate() + index);
+        const day = date.toISOString().slice(0, 10);
+        return { date: day, count: registrationsByDate.get(day) ?? 0 };
+      });
+
+      return res.json({
+        stats: {
+          totalUsers,
+          totalRecruiters,
+          totalCompanies,
+          totalJobs,
+          totalRevenueCents: revenueRecords[0]?.total ?? 0,
+        },
+        jobCategories: categoryRecords.map((record) => ({
+          category:
+            typeof record._id === "string" && record._id.trim()
+              ? record._id.trim()
+              : "Other",
+          count: record.count,
+        })),
+        userRegistrations,
+        recentPayments: recentPaymentRecords.map((payment) => {
+          const account = usersById.get(String(payment.userId ?? ""));
+          const email = account?.email ?? payment.customer_email ?? "";
+          const date = payment.createdAt ?? payment.payment_date;
+          return {
+            id:
+              payment._id?.toString() ??
+              payment.transactionId ??
+              payment.sessionId ??
+              "",
+            name: account?.name ?? email,
+            email,
+            plan: payment.planName ?? payment.plan ?? "Subscription",
+            amountCents: payment.amountCents ?? 0,
+            transactionId:
+              payment.transactionId ?? payment.sessionId ?? "",
+            date:
+              date instanceof Date
+                ? date.toISOString()
+                : typeof date === "string"
+                  ? date
+                  : new Date(0).toISOString(),
+          };
+        }),
+      });
+    } catch (error) {
+      console.error("Failed to load admin dashboard analytics:", error);
+      return res.status(500).json({
+        error: "Could not load platform analytics. Please try again.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/admin/payments",
+  requireAuthenticatedUser,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const now = new Date();
+      const monthStart = new Date(
+        Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)
+      );
+      const nextMonthStart = new Date(
+        Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)
+      );
+      const [
+        revenueRecords,
+        activeSeekerSubscriptions,
+        activeRecruiterSubscriptions,
+        paymentRecords,
+      ] = await Promise.all([
+        payments
+          .aggregate([
+            { $match: { payment_status: "paid" } },
+            {
+              $group: {
+                _id: null,
+                totalRevenueCents: { $sum: "$amountCents" },
+                monthlyRevenueCents: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $and: [
+                          {
+                            $gte: [
+                              { $ifNull: ["$createdAt", "$payment_date"] },
+                              monthStart,
+                            ],
+                          },
+                          {
+                            $lt: [
+                              { $ifNull: ["$createdAt", "$payment_date"] },
+                              nextMonthStart,
+                            ],
+                          },
+                        ],
+                      },
+                      { $ifNull: ["$amountCents", 0] },
+                      0,
+                    ],
+                  },
+                },
+              },
+            },
+          ])
+          .toArray(),
+        users.countDocuments({
+          $or: [{ role: "seeker" }, { role: { $exists: false } }],
+          plan: { $in: ["growth", "premium"] },
+        }),
+        users.countDocuments({
+          role: "recruiter",
+          plan: { $in: ["growth", "premium"] },
+        }),
+        payments
+          .find(
+            {},
+            {
+              projection: {
+                userId: 1,
+                plan: 1,
+                planName: 1,
+                amountCents: 1,
+                transactionId: 1,
+                payment_intent: 1,
+                sessionId: 1,
+                createdAt: 1,
+                payment_date: 1,
+                payment_status: 1,
+                status: 1,
+                customer_email: 1,
+              },
+            }
+          )
+          .sort({ createdAt: -1 })
+          .toArray(),
+      ]);
+
+      const userIds = [
+        ...new Set(
+          paymentRecords
+            .map((payment) => String(payment.userId ?? ""))
+            .filter(Boolean)
+        ),
+      ];
+      const mongoUserIds = userIds.flatMap((id) =>
+        ObjectId.isValid(id) ? [id, new ObjectId(id)] : [id]
+      );
+      const paymentUsers =
+        mongoUserIds.length > 0
+          ? await users
+              .find(
+                { _id: { $in: mongoUserIds } },
+                { projection: { email: 1 } }
+              )
+              .toArray()
+          : [];
+      const usersById = new Map(
+        paymentUsers.map((user) => [user._id.toString(), user])
+      );
+
+      return res.json({
+        summary: {
+          totalRevenueCents: revenueRecords[0]?.totalRevenueCents ?? 0,
+          monthlyRevenueCents: revenueRecords[0]?.monthlyRevenueCents ?? 0,
+          activeSeekerSubscriptions,
+          activeRecruiterSubscriptions,
+        },
+        payments: paymentRecords.map((payment) => {
+          const serialized = serializePayment(payment);
+          const account = usersById.get(String(payment.userId ?? ""));
+          const rawStatus = String(
+            payment.payment_status ?? payment.status ?? "unknown"
+          ).toLowerCase();
+          const status =
+            rawStatus === "complete" || rawStatus === "succeeded"
+              ? "Paid"
+              : rawStatus.charAt(0).toUpperCase() + rawStatus.slice(1);
+
+          return {
+            ...serialized,
+            email:
+              account?.email ??
+              payment.customer_email ??
+              payment.email ??
+              "",
+            plan: payment.planName ?? payment.plan ?? "Subscription",
+            status,
+          };
+        }),
+      });
+    } catch (error) {
+      console.error("Failed to load admin payment records:", error);
+      return res.status(500).json({
+        error: "Could not load platform payment records. Please try again.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/admin/users",
+  requireAuthenticatedUser,
+  requireAdmin,
+  async (req, res) => {
+    const email = typeof req.query.email === "string" ? req.query.email.trim() : "";
+    const role = typeof req.query.role === "string" ? req.query.role : "all";
+    if (role !== "all" && role !== "seeker" && role !== "recruiter") {
+      return res.status(400).json({
+        code: "INVALID_ROLE_FILTER",
+        error: "Choose a valid user role filter.",
+      });
+    }
+
+    const roleFilter =
+      role === "recruiter"
+        ? { role: "recruiter" }
+        : {
+            $or:
+              role === "seeker"
+                ? [{ role: "seeker" }, { role: { $exists: false } }]
+                : [
+                    { role: { $in: ["seeker", "recruiter"] } },
+                    { role: { $exists: false } },
+                  ],
+          };
+    const filter = {
+      ...roleFilter,
+      ...(email ? { email: { $regex: escapeRegex(email), $options: "i" } } : {}),
+    };
+
+    try {
+      const records = await users
+        .find(filter, {
+          projection: {
+            name: 1,
+            email: 1,
+            role: 1,
+            createdAt: 1,
+            accountStatus: 1,
+          },
+        })
+        .sort({ createdAt: -1 })
+        .toArray();
+      return res.json(records.map(serializeAdminUser));
+    } catch (error) {
+      console.error("Failed to search platform users:", error);
+      return res.status(500).json({
+        error: "Could not load platform users. Please try again.",
+      });
+    }
+  }
+);
+
+app.patch(
+  "/admin/users/:userId",
+  requireAuthenticatedUser,
+  requireAdmin,
+  async (req, res) => {
+    if (!ObjectId.isValid(req.params.userId)) {
+      return res.status(400).json({
+        code: "INVALID_USER_ID",
+        error: "A valid user ID is required.",
+      });
+    }
+
+    const { role, status } = req.body ?? {};
+    const hasRole = Object.prototype.hasOwnProperty.call(req.body ?? {}, "role");
+    const hasStatus = Object.prototype.hasOwnProperty.call(
+      req.body ?? {},
+      "status"
+    );
+    if (
+      hasRole === hasStatus ||
+      (hasRole && role !== "seeker" && role !== "recruiter") ||
+      (hasStatus && status !== "active" && status !== "suspended")
+    ) {
+      return res.status(400).json({
+        code: "INVALID_USER_UPDATE",
+        error: "Provide one valid role or account status change.",
+      });
+    }
+
+    if (req.authUser.id === req.params.userId) {
+      return res.status(403).json({
+        code: "SELF_UPDATE_NOT_ALLOWED",
+        error: "You cannot change your own account through user management.",
+      });
+    }
+
+    const userId = new ObjectId(req.params.userId);
+    const roleFilter = {
+      _id: userId,
+      $or: [
+        { role: { $in: ["seeker", "recruiter"] } },
+        { role: { $exists: false } },
+      ],
+    };
+
+    try {
+      const existing = await users.findOne(roleFilter);
+      if (!existing) {
+        return res.status(404).json({
+          code: "USER_NOT_FOUND",
+          error: "This seeker or recruiter account could not be found.",
+        });
+      }
+
+      const updates =
+        hasRole
+          ? { role }
+          : { accountStatus: status };
+      await users.updateOne({ _id: userId }, { $set: updates });
+      const updated = await users.findOne(
+        { _id: userId },
+        {
+          projection: {
+            name: 1,
+            email: 1,
+            role: 1,
+            createdAt: 1,
+            accountStatus: 1,
+          },
+        }
+      );
+      return res.json(serializeAdminUser(updated));
+    } catch (error) {
+      console.error("Failed to update platform user:", error);
+      return res.status(500).json({
+        error: "Could not update this account. Please try again.",
+      });
+    }
+  }
+);
 
 // Jobs related APIs
 app.get(
@@ -1692,7 +2206,7 @@ app.put(
 app.delete(
   "/jobs/:id",
   requireAuthenticatedUser,
-  requireRecruiter,
+  requireRecruiterOrAdmin,
   async (req, res) => {
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({
@@ -1701,10 +2215,11 @@ app.delete(
       });
     }
 
-   try {
+    try {
+      const isAdmin = req.authUser.role === "admin";
       const result = await jobs.deleteOne({
         _id: new ObjectId(req.params.id),
-        recruiterId: req.authUser.id,
+        ...(isAdmin ? {} : { recruiterId: req.authUser.id }),
       });
       if (!result.deletedCount) {
         return res.status(404).json({
@@ -1713,12 +2228,12 @@ app.delete(
         });
       }
       return res.json({ deleted: true });
-  } catch (err) {
-      console.error("Failed to delete recruiter job:", err);
+    } catch (err) {
+      console.error("Failed to delete job:", err);
       return res.status(500).json({
         error: "Could not delete the job. Please try again.",
       });
-   }
+    }
   }
 );
 
@@ -1738,9 +2253,75 @@ app.get(
   }
 );
 
+app.get(
+  "/admin/companies",
+  requireAuthenticatedUser,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const companyRecords = await companies
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
+      const recruiterIds = [
+        ...new Set(
+          companyRecords
+            .map((company) => String(company.recruiterId ?? ""))
+            .filter(Boolean)
+        ),
+      ];
+      const mongoRecruiterIds = recruiterIds.flatMap((id) =>
+        ObjectId.isValid(id) ? [id, new ObjectId(id)] : [id]
+      );
+      const recruiters =
+        mongoRecruiterIds.length > 0
+          ? await users
+              .find(
+                { _id: { $in: mongoRecruiterIds } },
+                { projection: { email: 1 } }
+              )
+              .toArray()
+          : [];
+      const recruitersById = new Map(
+        recruiters.map((recruiter) => [recruiter._id.toString(), recruiter])
+      );
+
+      return res.json(
+        companyRecords.map((company) => ({
+          id: company._id.toString(),
+          name: company.name ?? "",
+          recruiterEmail:
+            recruitersById.get(String(company.recruiterId ?? ""))?.email ?? "",
+          industry: company.industry ?? "",
+          status: ["Pending", "Approved", "Rejected"].includes(company.status)
+            ? company.status
+            : "Pending",
+          dateSubmitted:
+            company.createdAt instanceof Date
+              ? company.createdAt.toISOString()
+              : typeof company.createdAt === "string"
+                ? company.createdAt
+                : null,
+        }))
+      );
+    } catch (error) {
+      console.error("Failed to load admin company registrations:", error);
+      return res.status(500).json({
+        error: "Could not load company registrations. Please try again.",
+      });
+    }
+  }
+);
+
 app.get('/companies', async (req, res) => {
   try {
-    const cursor = companies.find({});
+    const cursor = companies.find({
+      $or: [
+        { status: { $regex: "^approved$", $options: "i" } },
+        { status: { $exists: false } },
+        { status: null },
+      ],
+    });
     const result = await cursor.toArray();
     res.send(result.map(serializeCompany));
   } catch (err) {
@@ -1750,7 +2331,14 @@ app.get('/companies', async (req, res) => {
 
 app.get('/companies/:id', async (req, res) => {
   try {
-    const company = await companies.findOne({ _id: new ObjectId(req.params.id) });
+    const company = await companies.findOne({
+      _id: new ObjectId(req.params.id),
+      $or: [
+        { status: { $regex: "^approved$", $options: "i" } },
+        { status: { $exists: false } },
+        { status: null },
+      ],
+    });
     if (!company) return res.status(404).send({ error: 'Company not found' });
     res.send(serializeCompany(company));
   } catch (err) {
@@ -1835,22 +2423,43 @@ app.patch(
   async (req, res) => {
     try {
       const { status } = req.body ?? {};
-      if (!["Pending", "Approved", "Rejected"].includes(status)) {
+      if (status !== "Approved" && status !== "Rejected") {
         return res.status(400).json({
           code: "INVALID_COMPANY_STATUS",
-          error: "Status must be Pending, Approved, or Rejected.",
+          error: "Status must be Approved or Rejected.",
         });
       }
       if (!ObjectId.isValid(req.params.id)) {
         return res.status(400).json({ error: "Invalid company id." });
       }
       const _id = new ObjectId(req.params.id);
-      const result = await companies.updateOne(
+      const existingCompany = await companies.findOne(
         { _id },
+        { projection: { status: 1 } }
+      );
+      if (!existingCompany) {
+        return res.status(404).json({ error: "Company not found." });
+      }
+
+      const currentStatus = existingCompany.status ?? "Pending";
+      const allowedPreviousStatuses =
+        status === "Approved" ? ["Pending", "Rejected"] : ["Pending", "Approved"];
+      if (!allowedPreviousStatuses.includes(currentStatus)) {
+        return res.status(409).json({
+          code: "INVALID_COMPANY_STATUS_TRANSITION",
+          error: `A company with ${currentStatus} status cannot be set to ${status}.`,
+        });
+      }
+
+      const result = await companies.updateOne(
+        { _id, status: existingCompany.status ?? null },
         { $set: { status, reviewedAt: new Date().toISOString() } }
       );
       if (!result.matchedCount) {
-        return res.status(404).json({ error: "Company not found." });
+        return res.status(409).json({
+          code: "COMPANY_STATUS_CHANGED",
+          error: "This company was updated by another admin. Refresh and retry.",
+        });
       }
       const company = await companies.findOne({ _id });
       return res.json(serializeCompany(company));
